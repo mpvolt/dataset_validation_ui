@@ -1,0 +1,36 @@
+
+  {
+    "title": "Incorrect deadline to round calculations",
+    "severity": "High",
+    "status": "Fixed",
+    "description": "The function requestRandomness  transforms the deadline input parameter into the beacon's round\nparameter. The rounding up uses delta % period , that leads to non-continuous result and\nundocumented features, as round(deadline1) = round(deadline1 + period - 1) .",
+    "recommendation": "Add round = ((delta % period) > 0) ? (round + 1) : (round);\n line or document the feature.",
+    "source_code_url": "https://github.com/frogworksio/anyrand/tree/a48f47c84c945d0729515324d51780ab3a9c6c56",
+    "broken_code_snippets": "['function requestRandomness(\\nuint256 deadline,\\nuint256 callbackGasLimit\\n) external payable override nonReentrant returns (uint256) {\\n. . .\\nuint256 genesis = drandBeacon.genesisTimestamp();\\nuint256 period = drandBeacon.period();\\nuint256 delta = deadline - genesis;\\nround = uint64((delta / period) + (delta % period));\\n. . .\\n}']",
+    "fixed_code_snippets": [
+      "round = ((delta % period) > 0) ? (round + 1) : (round);"
+    ],
+    "id": "ID_1",
+    "category": "Arithmetic & Logic Errors",
+    "language": [
+      "Solidity"
+    ],
+    "vulnerability_type": "single-file",
+    "context": [
+      {
+        "source": "https://github.com/frogworksio/anyrand/blob/a48f47c84c945d0729515324d51780ab3a9c6c56/contracts/Anyrand.sol",
+        "functions": [
+          {
+            "function": "requestRandomness",
+            "score": 90,
+            "reasoning": "No reasoning provided",
+            "key_matches": [
+              "round = uint64((delta / period) + (delta % period));",
+              "round(deadline1) = round(deadline1 + period - 1)"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+  
