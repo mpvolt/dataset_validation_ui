@@ -2,7 +2,7 @@ import json
 from openai import OpenAI
 import os
 import sys
- 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -43,143 +43,170 @@ def prefilter_commits(finding: dict, commits: list[dict], top_n=5) -> list[dict]
     scored.sort(key=lambda x: x['embedding_score'], reverse=True)
     return scored[:top_n]
 
+def vulnerability_block(
+    title,
+    description,
+    recommendation,
+    broken_code_snippet,
+    fixed_code_snippet,
+    files
+):
+    fields = []
+
+    if title:
+        fields.append(f"Title: {title}")
+
+    if description:
+        fields.append(f"Issue: {description[:300]}")
+
+    if recommendation:
+        fields.append(f"Fix Needed: {recommendation[:200]}")
+
+    if broken_code_snippet:
+        fields.append(f"Broken Code Pattern: {broken_code_snippet}")
+
+    if fixed_code_snippet:
+        fields.append(f"Fixed Code Pattern: {fixed_code_snippet}")
+
+    if files:
+        fields.append(f"Files: {files}")
+
+    return "\n".join(fields)
+
 # --- Step 2: GPT prompt ranking ---
-def rank_with_gpt(finding: dict, commit_data_list: list[dict]) -> list[dict]:
+def rank_with_gpt(finding: dict, commit_data_list: list[dict], max_workers: int = 10) -> list[dict]:
     """
     Given a vulnerability finding and a list of structured commit data,
-    ask GPT-4o-mini to assign a relevance score to each commit.
+    uses a ThreadPoolExecutor to parallelize the relevance scoring for each commit.
     """
+    
+    # --- Prepare Static Vulnerability Data ---
+    vuln_title = finding.get('title', 'Unknown')
+    vuln_description = finding.get('description', '')
+    vuln_recommendation = finding.get('recommendation', '')
+    broken_code = finding.get('broken_code_snippets', [])
+    fixed_code = finding.get('fixed_code_snippet', [])
+    broken_code_snippet = broken_code[0][:500] if broken_code and len(broken_code) > 0 else ""
+    fixed_code_snippet = broken_code[0][:500] if fixed_code and len(fixed_code) > 0 else ""
+    files = finding.get('files', [])
 
-    # Build commit dump for the model - MORE CONCISE FORMAT
-    commit_blocks = []
-    for idx, commit in enumerate(commit_data_list, 1):
-        message = commit.get("message", "")
+    vuln_text = vulnerability_block(
+        vuln_title,
+        vuln_description,
+        vuln_recommendation,
+        broken_code_snippet,
+        fixed_code_snippet,
+        files
+    )
+
+    
+    def rank_single_commit(commit: dict) -> dict:
+        """
+        Internal function to handle the API call and parsing for a single commit.
+        This function will be executed in parallel threads.
+        """
         url = commit.get("commit_url", "")
-
-        # Collect all changed lines across all files
+        message = commit.get("message", "")
+        
+        # 1. Build the specific commit block (same logic as before)
         all_changes = []
         for file_info in commit.get("files_changed", []):
             fpath = file_info.get("filename", "")
             for hunk in file_info.get("hunks", []):
-                # Only include actual code changes (lines starting with +/-)
                 changed_lines = [
                     ln.strip() for ln in hunk.get("lines", [])
                     if ln.strip().startswith(('+', '-')) and not ln.strip().startswith(('+++', '---'))
                 ]
                 if changed_lines:
-                    all_changes.append(f"{fpath}: {' | '.join(changed_lines[:5])}")  # Limit to 5 lines per hunk
+                    all_changes.append(f"{fpath}: {' | '.join(changed_lines[:5])}")  
 
-        changes_summary = "\n".join(all_changes[:10])  # Limit total changes shown
+        changes_summary = "\n".join(all_changes[:10])
 
-        block = f"""Commit {idx}:
+        commit_text = f"""Commit 1: (ONLY COMMIT TO ANALYZE)
 URL: {url}
 Message: {message}
 Key Changes: {changes_summary if changes_summary else 'No significant changes detected'}
 """
-        commit_blocks.append(block)
-
-    commits_text = "\n".join(commit_blocks)
-
-    # Extract key information from finding
-    vuln_title = finding.get('title', 'Unknown')
-    vuln_description = finding.get('description', '')
-    vuln_recommendation = finding.get('recommendation', '')
-    broken_code = finding.get('broken_code_snippets', [])
-    
-    # Create a more focused snippet of broken code
-    broken_code_snippet = ""
-    if broken_code and len(broken_code) > 0:
-        broken_code_snippet = broken_code[0][:500]  # First snippet, max 500 chars
-
-    # Build the prompt - MORE STRUCTURED AND CONCISE
-    prompt = f"""You are analyzing commits to find which ones fix a specific vulnerability.
+        
+        # 2. Build the prompt
+        prompt = f"""You are analyzing a single commit to find if it fixes a specific vulnerability.
 
 VULNERABILITY:
-Title: {vuln_title}
-Issue: {vuln_description[:300]}
-Fix Needed: {vuln_recommendation[:200]}
-Broken Code Pattern: {broken_code_snippet}
+{vuln_text}
 
-COMMITS TO ANALYZE:
-{commits_text}
+COMMIT TO ANALYZE:
+{commit_text}
 
 TASK:
-Score each commit from 0-100 based on how likely it fixes this specific vulnerability.
+Score this single commit from 0-100 based on how likely it fixes this specific vulnerability.
 
-SCORING RULES:
-1. Score 90-100: Commit directly fixes the exact issue described
-   - Message mentions "fix", "H-1", or the vulnerability type
-   - Code changes match the recommended fix pattern
-   - Changes are in the vulnerable function/location
+IMPORTANT:
+- bug_related_files: Files that DIRECTLY relate to the vulnerability (exclude test files, helpers, unrelated contracts)
 
-2. Score 60-89: Commit is highly related but may be partial fix
-   - Changes related functions or files
-   - Adds tests for the vulnerability
-   - Refactors vulnerable code
-
-3. Score 30-59: Commit is somewhat related
-   - Touches same files but different functions
-   - Related feature changes
-
-4. Score 0-29: Commit is unrelated
-   - Different files/features
-   - Formatting, comments, dependencies
 
 OUTPUT REQUIRED (valid JSON):
 {{
-  "rankings": [
-    {{"url": "commit_url_1", "score": 95, "reasoning": "Directly fixes the round calculation bug"}},
-    {{"url": "commit_url_2", "score": 10, "reasoning": "Unrelated feature addition"}}
-  ]
+  "url": "{url}",
+  "score": 95, 
+  "bug_related_files": ["Contract.sol"],
 }}
 
-Analyze each commit and provide scores:"""
+Analyze the commit and provide the score and reasoning:"""
+        
+        # 3. Call GPT and handle parsing/errors
+        try:
+            # NOTE: 'client' must be defined outside this function for the thread to access it
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a code security expert. Always respond with valid JSON object containing 'url', 'score', and 'reasoning' keys."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0,
+                response_format={"type": "json_object"}
+            )
+            raw = response.choices[0].message.content
+            parsed = json.loads(raw)
+            
+            # Normalize score and return result
+            if "url" in parsed and "score" in parsed:
+                if parsed.get("score") > 0:
+                    return {
+                        "url": parsed["url"],
+                        "score": parsed["score"],
+                        "relevant_files": parsed.get("bug_related_files", "No related files provided")
 
-    # Call GPT with more explicit JSON formatting
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a code security expert. Always respond with valid JSON containing a 'rankings' array."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=0,
-        response_format={"type": "json_object"}
-    )
+                    }
+            
+            # Fallback for unexpected structure
+            return {"url": url, "score": 0.0, "reasoning": "Failed to parse GPT response: Missing keys."}
 
-    raw = response.choices[0].message.content
+        except json.JSONDecodeError:
+            return {"url": url, "score": 0.0, "reasoning": "JSON decode error from API response."}
+        except Exception as e:
+            return {"url": url, "score": 0.0, "reasoning": f"Unexpected API error: {str(e)[:50]}"}
+    
+    # --- Execute Parallel Ranking ---
+    all_rankings = []
+    
+    # Use ThreadPoolExecutor for I/O-bound tasks (API calls)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all commits to the thread pool
+        future_to_commit = {
+            executor.submit(rank_single_commit, commit): commit 
+            for commit in commit_data_list
+        }
+        
+        # Wait for results as they complete
+        print(f"Submitting {len(commit_data_list)} commits for parallel ranking with {max_workers} workers...")
+        for future in as_completed(future_to_commit):
+            result = future.result()
+            all_rankings.append(result)
 
-    # Parse JSON with better error handling
-    try:
-        parsed = json.loads(raw)
-
-        if "rankings" in parsed and isinstance(parsed["rankings"], list):
-            # Normalize scores to 0-1 range if they're 0-100
-            rankings = parsed["rankings"]
-            for ranking in rankings:
-                if "score" in ranking and ranking["score"] > 1:
-                    ranking["score"] = ranking["score"] / 100.0
-            return rankings
-
-        # Fallback: look for any list in the response
-        for key, value in parsed.items():
-            if isinstance(value, list) and len(value) > 0:
-                # Check if it looks like rankings
-                if isinstance(value[0], dict) and "url" in value[0]:
-                    for item in value:
-                        if "score" in item and item["score"] > 1:
-                            item["score"] = item["score"] / 100.0
-                    return value
-
-        print(f"Unexpected JSON structure: {parsed}")
-        return []
-
-    except json.JSONDecodeError as e:
-        print(f"Failed to parse GPT output: {e}")
-        print(f"Raw output: {raw}")
-        return []
+    return all_rankings

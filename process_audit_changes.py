@@ -3,8 +3,11 @@ Process audit changes and get commit data for findings
 """
 import os
 import json
-from parse_all_commits import parse_all_commits
+
+from github import Github
+from parse_all_commits import Auth, parse_all_commits
 from compute_relevance_gpt import rank_with_gpt
+from add_detailed_file_info import process_commit_list
 
 class ProcessAuditChanges:
     """Class to process audit changes and get commit data for findings"""
@@ -14,11 +17,14 @@ class ProcessAuditChanges:
     
     def get_finding_commit_data(self, finding):
         """Get commit data for a finding"""
+        GITHUB_TOKEN = os.getenv("GITHUB_API_KEY")
+        auth = Auth.Token(GITHUB_TOKEN)
+        g = Github(auth=auth)
         try:
-            github_token = os.getenv("GITHUB_API_KEY")
-            commits = parse_all_commits(finding, github_token)
+            commits = parse_all_commits(finding)
             result = rank_with_gpt(finding, commits)
-            return result
+            detailed_info = process_commit_list(result)
+            return detailed_info
         except Exception as e:
             return {"error": str(e)}
 

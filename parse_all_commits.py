@@ -11,25 +11,18 @@ import os
 GITHUB_TOKEN = os.getenv("GITHUB_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-MAX_THREADS = 8  # adjust based on CPU/network capacity
+MAX_THREADS = 16  # Increased for better I/O parallelism
+CHUNK_SIZE = 50  # Process commits in chunks to manage memory
 
 auth = Auth.Token(GITHUB_TOKEN)
-g = Github(auth=auth)
+g = Github(auth=auth, per_page=100)  # Fetch more items per page
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 def get_owner_repo_from_url(url):
-    """
-    Extracts GitHub repo owner and repo name from a URL.
-
-    Returns:
-        (owner, repo) tuple or (None, None) if not found
-    """
-    # Match https://github.com/owner/repo and optional extra paths
+    """Extracts GitHub repo owner and repo name from a URL."""
     match = re.match(r"https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)", url)
     if match:
-        owner = match.group("owner")
-        repo = match.group("repo")
-        return owner, repo
+        return match.group("owner"), match.group("repo")
     return None, None
 
 def ensure_list(field):
@@ -41,118 +34,27 @@ def ensure_list(field):
         return field
     raise ValueError(f"Expected string or list, got {type(field)}")
 
-
-# --------------------------------------------------------
-# Extract relevant hunk lines given queries
-# --------------------------------------------------------
-def filter_hunks_by_query(commit, queries):
-    """
-    Returns only the hunk lines that contain at least one query match.
-    Queries are exact substrings.
-    """
-
-    relevant = []
-
-    files = commit.files
-    for f in files:
-        if not hasattr(f, "patch") or not f.patch:
-            continue
-
-        hunks = f.patch.split("\n")
-        current_hunk = []
-        header = None
-
-        for line in hunks:
-            if line.startswith("@@"):
-                if current_hunk:
-                    # flush the previous hunk if relevant
-                    if any(any(q in l for q in queries) for l in current_hunk):
-                        relevant.append({
-                            "file": f.filename,
-                            "header": header,
-                            "lines": current_hunk
-                        })
-                # start new hunk
-                header = line
-                current_hunk = [line]
-            else:
-                current_hunk.append(line)
-
-        # final flush
-        if current_hunk:
-            if any(any(q in l for q in queries) for l in current_hunk):
-                relevant.append({
-                    "file": f.filename,
-                    "header": header,
-                    "lines": current_hunk
-                })
-
-    return relevant
-
-
-# --------------------------------------------------------
-# Commit-level query search
-# --------------------------------------------------------
-def search_commit_for_query(commit, query):
-    """
-    Checks if a commit contains the query (in the message or patch).
-    Returns commit metadata if a match is found.
-    """
-
-    # match commit message
-    if query.lower() in commit.commit.message.lower():
-        return [{
-            "commit_url": commit.html_url,
-            "commit_message": commit.commit.message,
-            "query_match": query
-        }]
-
-    # match diff patch
-    for f in commit.files:
-        if hasattr(f, "patch") and f.patch and query in f.patch:
-            return [{
-                "commit_url": commit.html_url,
-                "commit_message": commit.commit.message,
-                "query_match": query
-            }]
-
-    return None
-
+def is_solidity_file(filename):
+    """Check if a file is a Solidity file (.sol extension)."""
+    return (
+        filename.endswith('.sol') and 
+        '.t.' not in filename and 
+        'interface' not in filename.lower() and
+        'mock' not in filename.lower() and
+        'test' not in filename.lower()
+    )
 
 # ==============================
-#  EXTRACT COMMIT HUNKS
+# EXTRACT COMMIT HUNKS (SOL FILES ONLY)
 # ==============================
 def extract_commit_hunks(commit):
-    """
-    Extracts file changes and hunks from a commit.
-    Returns:
-    [
-        {
-            "filename": "contracts/Anyrand.sol",
-            "status": "modified",
-            "additions": 10,
-            "deletions": 2,
-            "changes": 12,
-            "hunks": [
-                {
-                    "header": "@@ -53,7 +53,8 @@ function requestRandomness(...)",
-                    "lines": [
-                        "- old code",
-                        "+ new code",
-                        "  unchanged line"
-                    ]
-                },
-                ...
-            ]
-        },
-        ...
-    ]
-    """
-
+    """Extract file changes and hunks from a commit (only .sol files)."""
     results = []
-
     for file in commit.files:
-        patch = file.patch  # This contains the **unified diff**.
+        if not is_solidity_file(file.filename):
+            continue
+            
+        patch = file.patch
         if not patch:
             continue
 
@@ -161,7 +63,6 @@ def extract_commit_hunks(commit):
 
         for line in patch.split("\n"):
             if line.startswith("@@"):
-                # Start of a new hunk
                 if current_hunk:
                     hunks.append(current_hunk)
                 current_hunk = {"header": line, "lines": []}
@@ -169,7 +70,6 @@ def extract_commit_hunks(commit):
                 if current_hunk:
                     current_hunk["lines"].append(line)
 
-        # Append the final hunk
         if current_hunk:
             hunks.append(current_hunk)
 
@@ -183,7 +83,6 @@ def extract_commit_hunks(commit):
         })
 
     return results
-
 
 # ==============================
 # GENERATE AI PROMPT
@@ -216,7 +115,6 @@ def extract_candidates_with_gpt(prompt):
         messages=[{"role": "user", "content": prompt}],
         temperature=0,
         response_format={"type": "json_object"}
-
     )
     gpt_output = response.choices[0].message.content
 
@@ -227,102 +125,181 @@ def extract_candidates_with_gpt(prompt):
     return candidates
 
 # ==============================
-# SEARCH SINGLE COMMIT FOR QUERY
+# OPTIMIZED: BATCH FETCH & FILTER
 # ==============================
-def search_commit_for_query(commit, query):
+def fetch_commit_batch(commit_sha, repo):
+    """
+    Fetch a single commit with full details.
+    Returns the commit object or None on error.
+    """
+    try:
+        return repo.get_commit(commit_sha)
+    except Exception as e:
+        print(f"Error fetching commit {commit_sha}: {e}")
+        return None
+
+def matches_any_query_compiled(text, compiled_patterns, original_queries):
+    """Check if text matches any of the compiled search patterns."""
+    if not text:
+        return []
+    
     matches = []
-    if commit.commit.message and re.search(query, commit.commit.message, re.IGNORECASE):
-        for f in commit.files:
-            if f.patch and re.search(query, f.patch, re.IGNORECASE):
-                matches.append({
-                    "commit_url": commit.html_url,
-                    "commit_message": commit.commit.message,
-                    "file": f.filename,
-                    "query_match": query
-                })
+    for pattern, query in zip(compiled_patterns, original_queries):
+        if pattern.search(text):
+            matches.append(query)
     return matches
 
-# ==============================
-# SEARCH ALL COMMITS IN PARALLEL
-# ==============================
-def search_github_commits_parallel(function_names, variable_names, code_patterns,
-                                   owner, name, github_token):
-    repo = g.get_repo(f"{owner}/{name}")
-    all_queries = function_names + variable_names + code_patterns
-    commits = list(repo.get_commits())
-
+def filter_commit_in_memory_compiled(commit, compiled_patterns, original_queries):
+    """
+    Filter a commit in memory using pre-compiled regex patterns.
+    Returns result dict or None if no match.
+    """
+    # Early exit: Check if any .sol files exist first (cheapest check)
+    has_sol_files = any(is_solidity_file(f.filename) for f in commit.files)
+    if not has_sol_files:
+        return None
+    
+    matched_queries = []
+    
+    # Check commit message
+    if commit.commit.message:
+        message_matches = matches_any_query_compiled(commit.commit.message, compiled_patterns, original_queries)
+        matched_queries.extend(message_matches)
+    
+    # Check .sol file patches
+    for file in commit.files:
+        if is_solidity_file(file.filename) and file.patch:
+            patch_matches = matches_any_query_compiled(file.patch, compiled_patterns, original_queries)
+            matched_queries.extend(patch_matches)
+            
+            # Early exit: if we found matches, no need to check all files
+            if matched_queries:
+                break
+    
+    if not matched_queries:
+        return None
+    
+    # Remove duplicates while preserving order
     seen = set()
-    results = []
+    matched_queries = [q for q in matched_queries if not (q in seen or seen.add(q))]
+    
+    # Extract hunks only if we have matches
+    hunk_data = extract_commit_hunks(commit)
+    
+    # Skip if no .sol files with patches
+    if not hunk_data:
+        return None
+    
+    return {
+        "commit_url": commit.html_url,
+        "message": commit.commit.message,
+        "query_match": ", ".join(matched_queries),
+        "files_changed": hunk_data
+    }
 
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = []
-        for commit in commits:
-            for query in all_queries:
-                futures.append(executor.submit(search_commit_for_query, commit, query))
+def search_commits_optimized(commits, all_queries, repo, max_threads=16):
+    """
+    Optimized search that:
+    1. Fetches commits in chunks to manage memory
+    2. Filters them in memory (no additional API calls)
+    3. Short-circuits on first match per commit
+    """
+    # Compile regex patterns once for all commits
+    compiled_patterns = [re.compile(query, re.IGNORECASE) for query in all_queries]
+    
+    total_commits = len(commits)
+    print(f"Processing {total_commits} commits in chunks of {CHUNK_SIZE}...")
+    
+    all_results = []
+    
+    # Process in chunks to manage memory
+    for chunk_start in range(0, total_commits, CHUNK_SIZE):
+        chunk_end = min(chunk_start + CHUNK_SIZE, total_commits)
+        chunk = commits[chunk_start:chunk_end]
+        
+        print(f"Processing commits {chunk_start+1}-{chunk_end}/{total_commits}...")
+        
+        # Phase 1: Fetch chunk of commits in parallel
+        fetch_futures = []
+        with ThreadPoolExecutor(max_workers=max_threads) as executor:
+            for commit in chunk:
+                fetch_futures.append(executor.submit(fetch_commit_batch, commit.sha, repo))
+            
+            # Collect fetched commits as they complete
+            fetched_commits = []
+            for future in as_completed(fetch_futures):
+                commit_obj = future.result()
+                if commit_obj:
+                    fetched_commits.append(commit_obj)
+        
+        # Phase 2: Filter in memory (parallel processing, no API calls)
+        filter_futures = []
+        with ThreadPoolExecutor(max_workers=max_threads) as executor:
+            for commit in fetched_commits:
+                filter_futures.append(
+                    executor.submit(filter_commit_in_memory_compiled, commit, compiled_patterns, all_queries)
+                )
+            
+            for future in as_completed(filter_futures):
+                result = future.result()
+                if result:
+                    all_results.append(result)
+        
+        print(f"  Found {len([r for r in all_results if chunk_start <= all_results.index(r) < chunk_end])} matches in this chunk")
+    
+    print(f"Total matches found: {len(all_results)}")
+    return all_results
 
-        for future in as_completed(futures):
-            matches = future.result()
-            if not matches:
-                continue
-
-            for m in matches:
-                commit_url = m["commit_url"]
-
-                # ensure unique commit
-                if commit_url in seen:
-                    continue
-                seen.add(commit_url)
-
-                # extract only relevant hunks
-                commit = repo.get_commit(commit_url.split("/")[-1])
-                relevant_hunks = filter_hunks_by_query(commit, all_queries)
-
-                results.append({
-                    "commit_url": commit_url,
-                    "message": m["commit_message"],
-                    "query_match": m["query_match"],
-                    "relevant_hunks": relevant_hunks
-                })
-
-    return results
-
-
-# ==============================
-# Search commits in PR in parallel
-# ==============================
-def search_pr_commits_parallel(pr_number, function_names, variable_names, code_patterns, owner, name):
+def search_github_commits_parallel(function_names, variable_names, code_patterns,
+                                   owner, name, max_threads=16, max_commits=None):
+    """
+    Search all commits in a repository for matching queries.
+    Optimized to fetch once and filter in memory.
+    
+    Args:
+        max_commits: Limit number of commits to search (None = all)
+    """
     repo = g.get_repo(f"{owner}/{name}")
-    pr = repo.get_pull(pr_number)
-    commits = list(pr.get_commits())
-
     all_queries = function_names + variable_names + code_patterns
-    results = []
-    seen = set()       # <-- store commit URLs only
+    
+    # Early exit if no queries
+    if not all_queries:
+        print("No search queries provided")
+        return []
+    
+    # Get lightweight commit list (only 1 API call)
+    print("Fetching commit list...")
+    if max_commits:
+        commits = list(repo.get_commits()[:max_commits])
+        print(f"Limiting to {len(commits)} most recent commits")
+    else:
+        commits = list(repo.get_commits())
+        print(f"Found {len(commits)} total commits")
+    
+    return search_commits_optimized(commits, all_queries, repo, max_threads)
 
-
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = []
-        for commit in commits:
-            for query in all_queries:
-                futures.append(executor.submit(search_commit_for_query, commit, query))
-        for future in as_completed(futures):
-            matches = future.result()
-            if not matches:
-                continue
-
-            for m in matches:
-                commit_url = m["commit_url"]
-
-                if commit_url not in seen:
-                    seen.add(commit_url)
-                    hunk_data = extract_commit_hunks(commit)
-                    results.append({
-                        "commit_url": commit_url,
-                        "message": m["commit_message"],
-                        "query_match": m["query_match"],
-                        "files_changed": hunk_data
-                    })
-    return results
+def search_pr_commits_parallel(pr_number, function_names, variable_names, code_patterns, 
+                               owner, name, max_threads=16):
+    """
+    Search commits in a PR for matching queries.
+    Optimized to fetch once and filter in memory.
+    """
+    repo = g.get_repo(f"{owner}/{name}")
+    pr = repo.get_pull(int(pr_number))
+    
+    all_queries = function_names + variable_names + code_patterns
+    
+    # Early exit if no queries
+    if not all_queries:
+        print("No search queries provided")
+        return []
+    
+    # Get lightweight commit list (only 1 API call)
+    print(f"Fetching commits for PR #{pr_number}...")
+    commits = list(pr.get_commits())
+    print(f"Found {len(commits)} commits in PR")
+    
+    return search_commits_optimized(commits, all_queries, repo, max_threads)
 
 # ==============================
 # PARSE GITHUB URL
@@ -332,14 +309,14 @@ def parse_github_url(url):
     Returns a dict: {"type": "commit|pull|compare|blob", "owner": ..., "repo": ..., "id_or_path": ...}
     """
     patterns = {
-        "commit": r"github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/commit/(?P<sha>[a-f0-9]+)",
         "pull": r"github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<pr_number>\d+)",
+        "commit": r"github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/commit/(?P<sha>[a-f0-9]+)",
         "compare": r"github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/compare/(?P<base>[^.]+)\.\.\.(?P<head>[^/]+)",
         "blob": r"github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/blob/(?P<ref>[^/]+)/(?P<path>.+)"
     }
 
     for t, pat in patterns.items():
-        m = re.match(pat, url)
+        m = re.search(pat, url)
         if m:
             data = m.groupdict()
             data["type"] = t
@@ -347,88 +324,73 @@ def parse_github_url(url):
     return {"type": "unknown"}
 
 # ==============================
-# PROCESS EACH TYPE
-# ==============================
-def process_commit(owner, repo_name, sha):
-    repo = g.get_repo(f"{owner}/{repo_name}")
-    commit = repo.get_commit(sha)
-    # Do whatever processing you need on the commit
-    return commit
-
-def process_pull(owner, repo_name, pr_number):
-    repo = g.get_repo(f"{owner}/{repo_name}")
-    pr = repo.get_pull(int(pr_number))
-    commits = list(pr.get_commits())
-    # Process each commit in the PR
-    return commits
-
-def process_compare(owner, repo_name, base, head):
-    repo = g.get_repo(f"{owner}/{repo_name}")
-    comparison = repo.compare(base, head)
-    commits = comparison.commits
-    return commits
-
-def process_blob(owner, repo_name, ref, path):
-    repo = g.get_repo(f"{owner}/{repo_name}")
-    contents = repo.get_contents(path, ref=ref)
-    return contents.decoded_content.decode("utf-8")
-
-# ==============================
-# ROUTER FUNCTION
-# ==============================
-def process_github_url(url):
-    info = parse_github_url(url)
-    t = info["type"]
-    if t == "commit":
-        return process_commit(info["owner"], info["repo"], info["sha"])
-    elif t == "pull":
-        return process_pull(info["owner"], info["repo"], info["pr_number"])
-    elif t == "compare":
-        return process_compare(info["owner"], info["repo"], info["base"], info["head"])
-    elif t == "blob":
-        return process_blob(info["owner"], info["repo"], info["ref"], info["path"])
-    else:
-        raise ValueError(f"Unknown GitHub URL type: {url}")
-
-
-# ==============================
 # MAIN
 # ==============================
-def parse_all_commits(vuln_report, github_token):
+def parse_all_commits(vuln_report):
     prompt = generate_ai_prompt(vuln_report)
     candidates = extract_candidates_with_gpt(prompt)
 
     urls = ensure_list(vuln_report.get("fix_commit_url")) or ensure_list(vuln_report.get("source_code_url"))
 
+    all_commits = []
+    
     for url in urls:
         owner, name = get_owner_repo_from_url(url)
+        
+        if not owner or not name:
+            print(f"Could not parse owner/repo from URL: {url}")
+            continue
 
+        print(f"\nAnalyzing repo: {owner}/{name}")
         print("Candidate functions/variables/patterns:", candidates)
 
-        commits = search_github_commits_parallel(
-            candidates.get("function_names", []),
-            candidates.get("variable_names", []),
-            candidates.get("code_patterns", []),
-            owner, 
-            name,
-            github_token
-        )
+        url_info = parse_github_url(url)
         
-        print(f"Found {len(commits)} commits matching candidates:")
-        for c in commits:
-            print(c)
-    return commits
+        if url_info["type"] == "pull":
+            pr_number = int(url_info["pr_number"])
+            print(f"Searching PR #{pr_number}...")
+            commits = search_pr_commits_parallel(
+                pr_number,
+                candidates.get("function_names", []),
+                candidates.get("variable_names", []),
+                candidates.get("code_patterns", []),
+                owner, 
+                name            
+            )
+        else:
+            print("Searching all commits in repository...")
+            commits = search_github_commits_parallel(
+                candidates.get("function_names", []),
+                candidates.get("variable_names", []),
+                candidates.get("code_patterns", []),
+                owner, 
+                name            
+            )
+        
+        print(f"Found {len(commits)} commits matching candidates")
+        all_commits.extend(commits)
+    
+    return all_commits
 
 def main():
+    import time
+    start_time = time.time()
+    
     with open("/Users/matt/vulnaut/dataset_validation_ui/filtered_Anyrand.json") as f:
         vuln_report = json.load(f)
     
-    commits = parse_all_commits(vuln_report, GITHUB_TOKEN)
+    commits = parse_all_commits(vuln_report)
 
     with open("commits.ndjson", "w") as f:
         for commit in commits:
             f.write(json.dumps(commit) + "\n")
-   
+    
+    elapsed = time.time() - start_time
+    print(f"\n✅ Saved {len(commits)} commits to commits.ndjson")
+    print(f"⏱️  Total time: {elapsed:.2f} seconds")
+    
+    if commits:
+        print(f"📊 Average time per commit: {elapsed/len(commits):.3f} seconds")
 
 if __name__ == "__main__":
     main()

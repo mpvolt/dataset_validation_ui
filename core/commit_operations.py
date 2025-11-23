@@ -8,134 +8,220 @@ from tkinter import messagebox
 from parse_all_commits import parse_all_commits
 from compute_relevance_gpt import rank_with_gpt
 from utils.url_helpers import add_clickable_urls
+import re
+from typing import Dict, List, Any
+
+FUNC_RE = re.compile(
+    r'\b(function|modifier)\s+([A-Za-z0-9_]+)\s*\('
+)
+
+def extract_functions_from_hunk(hunk_lines: List[str]) -> List[str]:
+    """Given raw hunk lines, return a list of function names that appear."""
+    seen = set()
+    for line in hunk_lines:
+        # strip +/- prefix that git adds
+        clean = line.lstrip("+- ").strip()
+        m = FUNC_RE.search(clean)
+        if m:
+            seen.add(m.group(2))
+    return sorted(seen)
+
+def parse_hunk_header(header: str) -> Dict[str, Any]:
+    """
+    Parse a header like '@@ -124,13 +124,15 @@ contract Anyrand is'
+    Returns from/to line numbers and lengths.
+    """
+    # Example: @@ -124,13 +124,15 @@
+    m = re.match(r"@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@", header)
+    if not m:
+        return {
+            "from_line": None,
+            "from_len": None,
+            "to_line": None,
+            "to_len": None,
+        }
+
+    from_line, from_len, to_line, to_len = m.groups()
+    return {
+        "from_line": int(from_line),
+        "from_len": int(from_len) if from_len else 1,
+        "to_line": int(to_line),
+        "to_len": int(to_len) if to_len else 1,
+    }
+
+
+def extract_changed_files_functions_and_hunks(commit_obj: Dict) -> List[Dict]:
+    """
+    Extract:
+    - files changed
+    - functions touched in those files
+    - hunks + line metadata
+    """
+    results = []
+
+    for file in commit_obj.get("files_changed", []):
+        file_entry = {
+            "filename": file["filename"],
+            "status": file["status"],
+            "functions_changed": set(),
+            "hunks": []
+        }
+
+        for hunk in file.get("hunks", []):
+            header = hunk["header"]
+            lines = hunk["lines"]
+
+            # Parse @@ header
+            hunk_meta = parse_hunk_header(header)
+
+            # Detect functions referenced in hunk
+            functions = extract_functions_from_hunk(lines)
+            for fn in functions:
+                file_entry["functions_changed"].add(fn)
+
+            file_entry["hunks"].append({
+                "header": header,
+                "meta": hunk_meta,
+                "lines": lines,
+                "functions_in_hunk": functions,
+            })
+
+        file_entry["functions_changed"] = sorted(file_entry["functions_changed"])
+        results.append(file_entry)
+
+    return results
+
+def parse_commit_for_dataset(commit: dict) -> dict:
+    """Convert a raw commit dict to structured dataset format"""
+    dataset_entry = {
+        "commit_url": commit.get("commit_url"),
+        "message": commit.get("message"),
+        "query_match": commit.get("query_match", ""),
+        "files_changed": []
+    }
+
+    for file_info in commit.get("relevant_hunks", []):
+        fpath = file_info.get("file")
+        hunks_list = []
+
+        for hunk_lines in file_info.get("lines", []):
+            changed_lines = [
+                ln.strip() for ln in hunk_lines
+                if ln.strip().startswith(('+', '-')) and not ln.strip().startswith(('+++', '---'))
+            ]
+
+            # Attempt to extract function name from hunk header
+            func_name = None
+            header_line = file_info.get("header", "")
+            if header_line.startswith("@@"):
+                import re
+                match = re.search(r"(function|def)\s+(\w+)", header_line)
+                if match:
+                    func_name = match.group(2)
+
+            hunks_list.append({
+                "header": header_line,
+                "changed_lines": changed_lines,
+                "function_name": func_name
+            })
+
+        dataset_entry["files_changed"].append({
+            "filename": fpath,
+            "hunks": hunks_list
+        })
+
+    return dataset_entry
+
 
 def run_get_commit_data(state, root):
     """Fetch and rank commit data for selected finding"""
     object_list = state.get('object_list')
     results_list = state.get('results_list')
     results_text = state.get('results_text')
-    
+
     selected = object_list.selection() if object_list else None
     if not selected:
         messagebox.showerror("Error", "Select an object first.")
         return
-    
+
     idx = int(selected[0])
     finding = state['loaded_objects'][idx]
-    
-    # Clear results and cache
+
+    # Clear previous UI results
     if results_list:
         results_list.delete(*results_list.get_children())
     if results_text:
         results_text.delete("1.0", "end")
         results_text.insert("1.0", "⏳ Fetching commit data... please wait...\n")
         results_text.update()
-    
+
     state['ranked_commits_cache'] = {}
-    
+
     # Clear file/function lists
     for key in ['files_checklist', 'functions_before_list', 'functions_after_list']:
         widget = state.get(key)
         if widget:
             widget.delete(*widget.get_children())
-    
+
     def worker():
         try:
             github_token = os.getenv("GITHUB_API_KEY")
-            
-            # Step 1: Parse all commits from the finding
-            commits = parse_all_commits(finding, github_token)
-            print(f"Parsed {len(commits)} commits")
-            
-            # Step 2: Rank commits with GPT
-            # Returns: [{'url': '...', 'score': 0.95, 'reasoning': '...'}, ...]
+
+            # Step 1: Parse all commits
+            raw_commits = parse_all_commits(finding, github_token)
+            print(f"Parsed {len(raw_commits)} commits")
+
+            # Step 2: Convert commits to structured dataset
+            commits = [parse_commit_for_dataset(c) for c in raw_commits]
+
+            # Step 3: Rank commits using GPT
             ranked_results = rank_with_gpt(finding, commits)
             print(f"Ranked {len(ranked_results)} commits")
-            
-            # Step 3: Combine rankings with full commit data
+
+            # Step 4: Combine rankings with full commit data
+            commit_map = {c.get("commit_url"): c for c in commits}
             combined_results = []
-            
-            # Create a URL to commit mapping for quick lookup
-            commit_map = {c.get("url"): c for c in commits if c.get("url")}
-            
             for ranked in ranked_results:
                 ranked_url = ranked.get("url")
                 if not ranked_url:
-                    print(f"Warning: Ranked result missing URL: {ranked}")
                     continue
-                
-                # Find the full commit data
                 full_commit = commit_map.get(ranked_url)
+
                 if not full_commit:
-                    print(f"Warning: No matching commit found for URL: {ranked_url}")
                     continue
-                
-                # Build the combined result with all available data
+
+                #Extract files/functions that changed + hunks
+                parsed_commit = extract_changed_files_functions_and_hunks(full_commit)
+
                 details = {
                     "url": ranked_url,
                     "score": ranked.get("score", 0),
                     "reasoning": ranked.get("reasoning", "No reasoning provided"),
-                    "message": full_commit.get("message", ""),
-                    "files": [],
-                    "before_blob": [],
-                    "after_blob": [],
-                    "functions_before": [],
-                    "functions_after": [],
-                }
-                
-                # Extract file and function data from the full commit's changes
-                changes = full_commit.get("changes", {})
-                for file_path, change in changes.items():
-                    # Add filename
-                    details["files"].append(file_path)
-                    
-                    # Add before blob if available
-                    before_blob = change.get("before_blob")
-                    if before_blob:
-                        details["before_blob"].append(before_blob)
-                    
-                    # Add after blob if available
-                    after_blob = change.get("after_blob")
-                    if after_blob:
-                        details["after_blob"].append(after_blob)
-                    
-                    # Add functions_before if available
-                    funcs_before = change.get("functions_before")
-                    if funcs_before:
-                        details["functions_before"].extend(funcs_before)
-                    
-                    # Add functions_after if available
-                    funcs_after = change.get("functions_after")
-                    if funcs_after:
-                        details["functions_after"].extend(funcs_after)
-                
+                    "context": parsed_commit
+                }                
+
                 combined_results.append(details)
-            
+
             # Sort by score descending
             combined_results.sort(key=lambda x: x.get("score", 0), reverse=True)
-            
             result_commits = combined_results
-            
+
         except Exception as e:
             import traceback
             error_msg = f"{str(e)}\n{traceback.format_exc()}"
             print(f"Error in worker thread: {error_msg}")
             result_commits = [{"error": error_msg}]
-        
+
         def update_ui():
             if results_text:
                 results_text.delete("1.0", "end")
             if results_list:
                 results_list.delete(*results_list.get_children())
-            
-            # Store results in state
-            if isinstance(result_commits, list):
-                state['ranked_commits'] = result_commits
-            else:
-                state['ranked_commits'] = [result_commits]
-            
-            # Populate the results list
+
+            state['ranked_commits'] = result_commits if isinstance(result_commits, list) else [result_commits]
+
             for idx, commit_obj in enumerate(state['ranked_commits']):
+                label = f"Result {idx}"
                 if isinstance(commit_obj, dict):
                     if "error" in commit_obj:
                         label = f"Error: {commit_obj['error'][:100]}"
@@ -143,39 +229,24 @@ def run_get_commit_data(state, root):
                         url = commit_obj["url"]
                         commit_hash = url.split("/")[-1] if "/" in url else url[:8]
                         score = commit_obj.get("score", 0)
-                        
-                        # Format score nicely
-                        if isinstance(score, float):
-                            score_str = f"{score:.2f}"
-                        else:
-                            score_str = str(score)
-                        
-                        # Get commit message preview
-                        msg = commit_obj.get("message", "")
-                        msg_preview = msg[:40] + "..." if len(msg) > 40 else msg
-                        
+                        score_str = f"{score:.2f}" if isinstance(score, float) else str(score)
+                        msg_preview = (commit_obj.get("message", "")[:40] + "...") if len(commit_obj.get("message", "")) > 40 else commit_obj.get("message", "")
                         label = f"#{idx+1} [{score_str}] {commit_hash[:8]} - {msg_preview}"
-                    else:
-                        label = f"Result {idx}"
-                else:
-                    label = f"Result {idx}"
-                
                 if results_list:
                     results_list.insert("", "end", iid=str(idx), values=(label,))
-            
-            # Show summary message
-            if not state['ranked_commits']:
-                if results_text:
+
+            # Show summary
+            if results_text:
+                if not state['ranked_commits']:
                     results_text.insert("1.0", "No results returned")
-            elif state['ranked_commits'] and "error" not in state['ranked_commits'][0]:
-                if results_text:
+                elif "error" not in state['ranked_commits'][0]:
                     summary = f"✓ Found {len(state['ranked_commits'])} commits\n"
                     summary += f"Top score: {state['ranked_commits'][0].get('score', 'N/A')}\n\n"
                     summary += "Select a commit to view details"
                     results_text.insert("1.0", summary)
-        
+
         root.after(0, update_ui)
-    
+
     threading.Thread(target=worker, daemon=True).start()
 
 def fix_finding(state):
