@@ -26,33 +26,3 @@ def add_clickable_urls(text_widget, content):
             lambda e, u=url: webbrowser.open(transform_blob_to_commit(u))
         )
 
-def get_blob_url_by_function(blob_list, function_name, files_list):
-    """
-    Find the correct blob URL for a function.
-    Handles formats like:
-    - ContractName::functionName
-    - filename.sol::functionName
-    """
-    if "::" in function_name:
-        prefix = function_name.split("::")[0]
-    elif " is " in function_name:
-        prefix = function_name.split(" is ")[0]
-    else:
-        prefix = function_name
-    
-    for i, file in enumerate(files_list):
-        file_base = file.replace(".sol", "")
-        
-        if (prefix.lower() == file_base.lower() or 
-            prefix.lower() == file.lower() or
-            file_base.lower() in prefix.lower() or
-            prefix.lower() in file_base.lower()):
-            
-            if i < len(blob_list):
-                return blob_list[i]
-    
-    # Fallback: return first blob if only one exists
-    if len(blob_list) == 1:
-        return blob_list[0]
-    
-    return None

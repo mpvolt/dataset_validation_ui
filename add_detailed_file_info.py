@@ -1,6 +1,6 @@
 import re
 from github import Github, Auth
-from typing import Dict, List, Optional
+from typing import Dict, List
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -282,8 +282,9 @@ def process_commit_list(commit_objects: List[dict], max_workers: int = 10) -> Li
                     "error": f"Unexpected error: {str(e)}",
                     "original_data": commit_objects[index]
                 }
-    
-    return detailed_commits
+
+    #Sort and retrieve top 5 commits
+    return sorted(detailed_commits, key=lambda c: c.get("score", 0), reverse=True)[:10]
 
 
 # ==============================

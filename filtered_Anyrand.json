@@ -1,36 +1,33 @@
-
-  {
-    "title": "Incorrect deadline to round calculations",
-    "severity": "High",
-    "status": "Fixed",
-    "description": "The function requestRandomness  transforms the deadline input parameter into the beacon's round\nparameter. The rounding up uses delta % period , that leads to non-continuous result and\nundocumented features, as round(deadline1) = round(deadline1 + period - 1) .",
-    "recommendation": "Add round = ((delta % period) > 0) ? (round + 1) : (round);\n line or document the feature.",
-    "source_code_url": "https://github.com/frogworksio/anyrand/tree/a48f47c84c945d0729515324d51780ab3a9c6c56",
-    "broken_code_snippets": "['function requestRandomness(\\nuint256 deadline,\\nuint256 callbackGasLimit\\n) external payable override nonReentrant returns (uint256) {\\n. . .\\nuint256 genesis = drandBeacon.genesisTimestamp();\\nuint256 period = drandBeacon.period();\\nuint256 delta = deadline - genesis;\\nround = uint64((delta / period) + (delta % period));\\n. . .\\n}']",
-    "fixed_code_snippets": [
-      "round = ((delta % period) > 0) ? (round + 1) : (round);"
-    ],
-    "id": "ID_1",
-    "category": "Arithmetic & Logic Errors",
-    "language": [
-      "Solidity"
-    ],
-    "vulnerability_type": "single-file",
-    "context": [
-      {
-        "source": "https://github.com/frogworksio/anyrand/blob/a48f47c84c945d0729515324d51780ab3a9c6c56/contracts/Anyrand.sol",
-        "functions": [
-          {
-            "function": "requestRandomness",
-            "score": 90,
-            "reasoning": "No reasoning provided",
-            "key_matches": [
-              "round = uint64((delta / period) + (delta % period));",
-              "round(deadline1) = round(deadline1 + period - 1)"
-            ]
-          }
-        ]
-      }
-    ]
-  }
-  
+{
+  "title": "Privileged functions",
+  "severity": "High",
+  "status": "Partially fixed",
+  "description": "The contract owner can mint an arbitrary number of tokens.\nThe owner can blacklist address from participation in transfers.\nThe owner can update transfer fee or disable it.",
+  "recommendation": "Secure owner's account, limit the total supply with a hard cap, limit max transfer\nfee.\nUpdate: The total supply has been capped to 5.882e27.\nThe maximum transfer fee has been limited to 10%.\nThe owner's blacklisting ability remains.\nWe recommend securing owner's account by using a smart account with distributed access.",
+  "source_code_url": "https://github.com/fibondev/fibon-token/tree/09521af3d298974266987d0c61198381ae484e86",
+  "fix_commit_url": "https://github.com/fibondev/fibon-token/commit/a91497ad44c8d654f5566f72c07d7bd22935e20e",
+  "broken_code_snippets": "['/**\\n* @notice Allows the owner to mint new tokens.\\n* @dev Only the contract owner can call this function.\\n* @param to The address to receive the minted tokens.\\n* @param amount The amount of tokens to mint.\\n*/\\nfunction mint(address to, uint256 amount) public onlyOwner {\\nrequire(!isBlacklisted[to], \"Recipient is blacklisted\");\\n_mint(to, amount);\\n}', '/**\\n* @notice Sets the fixed transfer fee\\n* @param newFee The new fee amount in token units\\n*/\\nfunction setTransferFee(uint256 newFee) external onlyOwner {\\nuint256 oldFee = transferFee;\\ntransferFee = newFee;\\nemit TransferFeeUpdated(oldFee, newFee);\\n}', '/**\\n* @notice Allows the owner to blacklist an address\\n* @param _account The address to blacklist\\n*/\\nfunction blacklistAddress(address _account) external onlyOwner {\\nrequire(_account != address(0), \"Invalid address\");\\nrequire(!isBlacklisted[_account], \"Address already blacklisted\");\\nisBlacklisted[_account] = true;\\nemit AddressBlacklisted(_account);\\n}']",
+  "id": "ID_1",
+  "category": "Access Control & Authorization",
+  "language": [
+    "Solidity"
+  ],
+  "vulnerability_type": "single-file",
+  "context": [
+    {
+      "source": "https://github.com/fibondev/fibon-token/blob/7e71551be403afcfb3d6a733faa71dc4db41dcbd/Multisig.sol",
+      "fix": "https://github.com/fibondev/fibon-token/blob/dd4e9e961ffbca0eb17f051ecfd6cbc2ab70cf6e/Multisig.sol",
+      "functions": [
+        {
+          "function": "constructor",
+          "score": 90,
+          "reasoning": "No reasoning provided",
+          "key_matches": [
+            "owner() == _msgSender()",
+            "Caller is not the admin"
+          ]
+        }
+      ]
+    }
+  ]
+}

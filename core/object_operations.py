@@ -3,7 +3,7 @@ Object-related operations: reset, context management
 """
 import json
 from tkinter import messagebox
-from utils.url_helpers import add_clickable_urls, get_blob_url_by_function
+from utils.url_helpers import add_clickable_urls
 
 def reset_selected_object(state):
     """Reset selected object to its original state"""
@@ -81,13 +81,10 @@ def add_function_to_context(state, result_idx, selected_function, function_type)
         }
     
     # Set blob URLs
-    ctx["source"] = ctx["source"] or get_blob_url_by_function(
-        commit.get("before_blob", []), selected_function, commit.get("files", [])
-    )
-    ctx["fix"] = ctx["fix"] or get_blob_url_by_function(
-        commit.get("after_blob", []), selected_function, commit.get("files", [])
-    )
-    
+    ctx["source"] = ctx["source"] or commit.get("before_blob", [])
+
+    ctx["fix"] = ctx["fix"] or commit.get("after_blob", [])
+
     # Add function
     if function_type == "before":
         if selected_function not in ctx["functions_before"]:

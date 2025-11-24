@@ -11,7 +11,7 @@ class FilterWidgets:
     def __init__(self, parent_paned, state):
         self.parent_paned = parent_paned
         self.state = state
-        self._create_ui()
+        #self._create_ui()
     
     def _create_ui(self):
         # Files section
@@ -195,28 +195,33 @@ class FilterWidgets:
         self.state[search_var_key] = search_var
     
     def populate_from_commit(self, commit_obj):
-        """Populate filter widgets from a commit object"""
-        # Clear and populate files
-        self.files_checklist.delete(*self.files_checklist.get_children())
-        if isinstance(commit_obj, dict) and "files" in commit_obj:
-            for file in commit_obj.get("files", []):
-                self.files_checklist.insert("", "end", values=(file,))
-        
-        # Clear and populate functions before
-        functions_before_list = self.state.get('functions_before_list')
-        if functions_before_list:
-            functions_before_list.delete(*functions_before_list.get_children())
-            if isinstance(commit_obj, dict) and "functions_before" in commit_obj:
-                for func in commit_obj.get("functions_before", []):
-                    functions_before_list.insert("", "end", values=(func,))
-        
-        # Clear and populate functions after
-        functions_after_list = self.state.get('functions_after_list')
-        if functions_after_list:
-            functions_after_list.delete(*functions_after_list.get_children())
-            if isinstance(commit_obj, dict) and "functions_after" in commit_obj:
-                for func in commit_obj.get("functions_after", []):
-                    functions_after_list.insert("", "end", values=(func,))
+        """Populate filter widgets from a single commit object."""
+
+        if not isinstance(commit_obj, dict):
+            return
+
+        # --- Populate Files ---
+        file_tree = self.state.get('files_checklist')
+        if file_tree:
+            file_tree.delete(*file_tree.get_children())
+            for f in commit_obj.get("files", []):
+                file_tree.insert("", "end", values=(f,))
+
+        # --- Populate Functions Before ---
+        before_tree = self.state.get('functions_before_list')
+        if before_tree:
+            before_tree.delete(*before_tree.get_children())
+            for fn in commit_obj.get("functions_before", []):
+                before_tree.insert("", "end", values=(fn,))
+
+        # --- Populate Functions After ---
+        after_tree = self.state.get('functions_after_list')
+        if after_tree:
+            after_tree.delete(*after_tree.get_children())
+            for fn in commit_obj.get("functions_after", []):
+                after_tree.insert("", "end", values=(fn,))
+
+
     
     def _on_files_search(self, *args):
         """Search files list"""
