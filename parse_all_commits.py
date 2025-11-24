@@ -205,7 +205,12 @@ def search_commits_optimized(commits, all_queries, repo, max_threads=16):
     3. Short-circuits on first match per commit
     """
     # Compile regex patterns once for all commits
-    compiled_patterns = [re.compile(query, re.IGNORECASE) for query in all_queries]
+    
+
+    compiled_patterns = [
+        re.compile(re.escape(query), re.IGNORECASE)
+        for query in all_queries
+    ]
     
     total_commits = len(commits)
     print(f"Processing {total_commits} commits in chunks of {CHUNK_SIZE}...")

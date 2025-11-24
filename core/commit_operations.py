@@ -5,8 +5,7 @@ import os
 import json
 import threading
 from tkinter import messagebox
-from parse_all_commits import parse_all_commits
-from compute_relevance_gpt import rank_with_gpt
+from process_audit_changes import ProcessAuditChanges
 from utils.url_helpers import add_clickable_urls
 import re
 from typing import Dict, List, Any
@@ -165,46 +164,12 @@ def run_get_commit_data(state, root):
 
     def worker():
         try:
-            github_token = os.getenv("GITHUB_API_KEY")
-
-            # Step 1: Parse all commits
-            raw_commits = parse_all_commits(finding, github_token)
-            print(f"Parsed {len(raw_commits)} commits")
-
-            # Step 2: Convert commits to structured dataset
-            commits = [parse_commit_for_dataset(c) for c in raw_commits]
-
-            # Step 3: Rank commits using GPT
-            ranked_results = rank_with_gpt(finding, commits)
-            print(f"Ranked {len(ranked_results)} commits")
-
-            # Step 4: Combine rankings with full commit data
-            commit_map = {c.get("commit_url"): c for c in commits}
-            combined_results = []
-            for ranked in ranked_results:
-                ranked_url = ranked.get("url")
-                if not ranked_url:
-                    continue
-                full_commit = commit_map.get(ranked_url)
-
-                if not full_commit:
-                    continue
-
-                #Extract files/functions that changed + hunks
-                parsed_commit = extract_changed_files_functions_and_hunks(full_commit)
-
-                details = {
-                    "url": ranked_url,
-                    "score": ranked.get("score", 0),
-                    "reasoning": ranked.get("reasoning", "No reasoning provided"),
-                    "context": parsed_commit
-                }                
-
-                combined_results.append(details)
+            processor = ProcessAuditChanges()
+            print(finding)
+            result_commits = processor.get_finding_commit_data(finding)
+            print(result_commits)
 
             # Sort by score descending
-            combined_results.sort(key=lambda x: x.get("score", 0), reverse=True)
-            result_commits = combined_results
 
         except Exception as e:
             import traceback
@@ -225,13 +190,13 @@ def run_get_commit_data(state, root):
                 if isinstance(commit_obj, dict):
                     if "error" in commit_obj:
                         label = f"Error: {commit_obj['error'][:100]}"
-                    elif "url" in commit_obj:
-                        url = commit_obj["url"]
-                        commit_hash = url.split("/")[-1] if "/" in url else url[:8]
+                    elif "commit_url" in commit_obj:
+                        url = commit_obj["commit_url"]
+                        commit_hash = commit_obj.get("sha", url.split("/")[-1] if "/" in url else "unknown")[:8]
                         score = commit_obj.get("score", 0)
                         score_str = f"{score:.2f}" if isinstance(score, float) else str(score)
                         msg_preview = (commit_obj.get("message", "")[:40] + "...") if len(commit_obj.get("message", "")) > 40 else commit_obj.get("message", "")
-                        label = f"#{idx+1} [{score_str}] {commit_hash[:8]} - {msg_preview}"
+                        label = f"#{idx+1} [{score_str}] {commit_hash} - {msg_preview}"
                 if results_list:
                     results_list.insert("", "end", iid=str(idx), values=(label,))
 
@@ -281,22 +246,58 @@ def fix_finding(state):
     
     context_entry = {}
     
+    # Extract blob URLs from files
+    files = commit.get("files", [])
+    
+    before_blobs = []
+    after_blobs = []
+    functions_before = []
+    functions_after = []
+    
+    for file_data in files:
+        # Collect blob URLs
+        if "blob_url_before" in file_data and file_data["blob_url_before"]:
+            before_blobs.append(file_data["blob_url_before"])
+        if "blob_url_after" in file_data and file_data["blob_url_after"]:
+            after_blobs.append(file_data["blob_url_after"])
+        
+        # Extract function names from hunks (basic regex pattern for function declarations)
+        import re
+        hunks = file_data.get("hunks", [])
+        for hunk in hunks:
+            context_line = hunk.get("context", "")
+            lines = hunk.get("lines", [])
+            
+            # Look for function patterns in context and lines
+            all_text = context_line + "\n" + "\n".join(lines)
+            
+            # Match common function patterns (Solidity, JavaScript, Python, etc.)
+            func_patterns = [
+                r'function\s+(\w+)\s*\(',  # Solidity/JavaScript
+                r'def\s+(\w+)\s*\(',  # Python
+                r'(\w+)\s*\([^)]*\)\s*{',  # C-style
+            ]
+            
+            for pattern in func_patterns:
+                matches = re.findall(pattern, all_text)
+                for match in matches:
+                    if match not in functions_before:
+                        functions_before.append(match)
+                    if match not in functions_after:
+                        functions_after.append(match)
+    
     # Only add fields if they exist and have values
-    before_blobs = commit.get("before_blob", [])
-    if before_blobs and len(before_blobs) > 0:
-        context_entry["source"] = before_blobs[0]
+    if before_blobs:
+        context_entry["source"] = before_blobs
     
-    after_blobs = commit.get("after_blob", [])
-    if after_blobs and len(after_blobs) > 0:
-        context_entry["fix"] = after_blobs[0]
+    if after_blobs:
+        context_entry["fix"] = after_blobs
     
-    funcs_before = commit.get("functions_before", [])
-    if funcs_before and len(funcs_before) > 0:
-        context_entry["functions_before"] = funcs_before
+    if functions_before:
+        context_entry["functions_before"] = functions_before
     
-    funcs_after = commit.get("functions_after", [])
-    if funcs_after and len(funcs_after) > 0:
-        context_entry["functions_after"] = funcs_after
+    if functions_after:
+        context_entry["functions_after"] = functions_after
     
     # Check if we have at least some data
     if not context_entry:
